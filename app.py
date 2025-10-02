@@ -109,6 +109,8 @@ class PlayerStat(Base):
     id = Column(Integer, primary_key=True)
     gameweek_id = Column(Integer, ForeignKey("gameweeks.id"))
     player_id = Column(Integer, ForeignKey("players.id"))
+
+    # Offense
     pass_yd = Column(Integer, default=0)
     pass_td = Column(Integer, default=0)
     int_thrown = Column(Integer, default=0)
@@ -118,6 +120,17 @@ class PlayerStat(Base):
     rec_yd = Column(Integer, default=0)
     rec_td = Column(Integer, default=0)
     fumble_lost = Column(Integer, default=0)
+
+    # Kicking
     fg_made = Column(Integer, default=0)
     fg_miss = Column(Integer, default=0)
-    xp_made =_
+    xp_made = Column(Integer, default=0)
+    xp_miss = Column(Integer, default=0)
+
+    # Defense/Special Teams
+    dst_sacks = Column(Integer, default=0)
+    dst_int = Column(Integer, default=0)
+    dst_fumrec = Column(Integer, default=0)
+    dst_td = Column(Integer, default=0)
+    points_allowed = Column(Integer, default=0)
+
