@@ -1,230 +1,518 @@
 from __future__ import annotations
-import enum, secrets
+
+import json
+import os
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict
-from fastapi import FastAPI, HTTPException, Depends, Header
+from typing import List, Optional, Dict, Any
+
+import httpx
+from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, Boolean, DateTime, Enum as SAEnum, UniqueConstraint
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Float, ForeignKey, DateTime, UniqueConstraint, Text
+)
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
-# --- DB setup (SQLite file) ---
-DATABASE_URL = "sqlite:///./fantasy_nfl_fpl.sqlite3"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# ------------------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./db.sqlite3")
+
+# SQLite needs check_same_thread = False
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- App + CORS ---
-app = FastAPI(title="NFL Fantasy (FPL-style)")
+app = FastAPI(title="GridCap API", version="0.2")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # for MVP; later restrict to your Vercel frontend origin
+    allow_origins=["*"],  # lock down in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Models ---
-class Position(str, enum.Enum): QB="QB"; RB="RB"; WR="WR"; TE="TE"; K="K"; DST="DST"
 
-INITIAL_BUDGET = 100.0
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ------------------------------------------------------------------------------
+# Models
+# ------------------------------------------------------------------------------
 
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
     email = Column(String, unique=True, index=True)
-    name = Column(String)
-    token = Column(String, unique=True, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+
+    entries = relationship("Entry", back_populates="user")
+
 
 class League(Base):
     __tablename__ = "leagues"
     id = Column(Integer, primary_key=True)
-    name = Column(String)
-    creator_id = Column(Integer, ForeignKey("users.id"))
-    created_at = Column(DateTime, default=datetime.utcnow)
+    name = Column(String, nullable=False)
+    owner_id = Column(Integer, ForeignKey("users.id"))
 
-class LeagueEntry(Base):
-    __tablename__ = "league_entries"
+    entries = relationship("Entry", back_populates="league")
+
+
+class Entry(Base):
+    __tablename__ = "entries"
     id = Column(Integer, primary_key=True)
     league_id = Column(Integer, ForeignKey("leagues.id"))
     user_id = Column(Integer, ForeignKey("users.id"))
-    team_name = Column(String)
-    budget = Column(Float, default=INITIAL_BUDGET)
-    total_points = Column(Integer, default=0)
-    __table_args__ = (UniqueConstraint("league_id","user_id",name="uq_league_user"),)
+    team_name = Column(String, nullable=False)
+    points = Column(Integer, default=0)
+
+    league = relationship("League", back_populates="entries")
+    user = relationship("User", back_populates="entries")
+
+    __table_args__ = (UniqueConstraint("league_id", "user_id", name="uq_entry_league_user"),)
+
 
 class Player(Base):
     __tablename__ = "players"
     id = Column(Integer, primary_key=True)
-    name = Column(String)
-    team = Column(String)
-    position = Column(SAEnum(Position))
+    external_id = Column(String, unique=True, index=True)   # Sleeper ID
+    name = Column(String, index=True, nullable=False)
+    team = Column(String(4), index=True)
+    pos = Column(String(4), index=True)                      # QB/RB/WR/TE/K/DST
+    price_m = Column(Float, default=6.0)                     # price in millions
 
-class PlayerPrice(Base):
-    __tablename__ = "player_prices"
-    id = Column(Integer, primary_key=True)
-    player_id = Column(Integer, ForeignKey("players.id"))
-    price = Column(Float)
-    effective_from_gw = Column(Integer, default=1)
 
 class Gameweek(Base):
     __tablename__ = "gameweeks"
-    id = Column(Integer, primary_key=True)
-    name = Column(String)
-    deadline_at = Column(DateTime)
-    finished = Column(Boolean, default=False)
+    id = Column(Integer, primary_key=True)                   # 1,2,3...
+    name = Column(String, nullable=False)
+    deadline_at = Column(DateTime, nullable=False)
 
-class Squad(Base):
-    __tablename__ = "squads"
+
+class SquadPick(Base):
+    __tablename__ = "squad_picks"
     id = Column(Integer, primary_key=True)
-    entry_id = Column(Integer, ForeignKey("league_entries.id"))
-    gameweek_id = Column(Integer, ForeignKey("gameweeks.id"))
-    player_ids_csv = Column(String)      # 15 ids
-    starters_csv = Column(String)        # 9 ids
-    captain_id = Column(Integer, nullable=True)
-    vice_captain_id = Column(Integer, nullable=True)
-    chips = Column(String, default="")
-    __table_args__ = (UniqueConstraint("entry_id","gameweek_id", name="uq_entry_gw"),)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    gameweek = Column(Integer, index=True, nullable=False)
+    player_id = Column(Integer, ForeignKey("players.id"), index=True, nullable=False)
+
+    __table_args__ = (UniqueConstraint("user_id", "gameweek", "player_id", name="uq_squad_one"),)
+
+
+class Lineup(Base):
+    __tablename__ = "lineups"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    gameweek = Column(Integer, index=True, nullable=False)
+    starters_json = Column(Text, nullable=False, default="[]")  # JSON list of player_ids
+    captain_id = Column(Integer, ForeignKey("players.id"), nullable=True)
+    vice_captain_id = Column(Integer, ForeignKey("players.id"), nullable=True)
+    chip = Column(String, nullable=True)  # "BB","TC","WC", or None
+
+    __table_args__ = (UniqueConstraint("user_id", "gameweek", name="uq_lineup_one"),)
+
 
 Base.metadata.create_all(bind=engine)
 
-# --- Helpers ---
-def get_db():
-    db = SessionLocal()
-    try: yield db
-    finally: db.close()
+# ------------------------------------------------------------------------------
+# Schemas
+# ------------------------------------------------------------------------------
 
-def current_user(x_user: Optional[str] = Header(None), db: Session = Depends(get_db)) -> User:
-    if not x_user: raise HTTPException(401, "Missing X-User header")
-    u = db.query(User).filter(User.id==int(x_user)).first()
-    if not u: raise HTTPException(401, "Invalid X-User")
-    return u
+class RegisterIn(BaseModel):
+    name: str
+    email: str
 
-def parse_ids(csv: str) -> List[int]:
-    return [int(x) for x in csv.split(",") if x.strip()] if csv else []
 
-# --- Schemas ---
-class RegisterReq(BaseModel): email:str; name:str
-class RegisterRes(BaseModel): id:int; token:str
-class LeagueCreateReq(BaseModel): name:str; team_name:str
-class JoinLeagueReq(BaseModel): league_id:int; team_name:str
-class PlayerSeedItem(BaseModel): name:str; team:str; position:Position; price:float
-class SeedReq(BaseModel): players:List[PlayerSeedItem]
-class GwCreateReq(BaseModel): id:int; name:str; deadline_at:datetime
-class SquadSetReq(BaseModel): gameweek:int=Field(...,ge=1); player_ids:List[int]
-class LineupSetReq(BaseModel): gameweek:int; starters:List[int]; captain_id:int; vice_captain_id:int; chip:Optional[str]=None
+class LeagueCreateIn(BaseModel):
+    userId: Optional[int] = None
+    name: Optional[str] = "UK NFL FPL League"
+    team_name: Optional[str] = None
+    teamName: Optional[str] = None
 
-# --- Routes ---
-@app.get("/health")
-def health(): return {"ok": True, "time": datetime.utcnow().isoformat()}
 
-@app.post("/register", response_model=RegisterRes)
-def register(req: RegisterReq, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.email==req.email).first():
-        raise HTTPException(400, "Email already registered")
-    token = secrets.token_hex(16)
-    u = User(email=req.email, name=req.name, token=token)
-    db.add(u); db.commit(); db.refresh(u)
-    return RegisterRes(id=u.id, token=u.token)
+class LeagueJoinIn(BaseModel):
+    userId: Optional[int] = None
+    league_id: Optional[int] = None
+    leagueId: Optional[int] = None
+    team_name: Optional[str] = None
+    teamName: Optional[str] = None
+
+
+class SquadSetIn(BaseModel):
+    gameweek: int = Field(..., ge=1)
+    player_ids: List[int] = Field(..., min_items=1, max_items=30)
+    # fallback keys supported by older FE:
+    picks: Optional[List[int]] = None
+
+
+class LineupSetIn(BaseModel):
+    gameweek: int
+    starters: List[int] = Field(..., min_items=1, max_items=30)
+    captain_id: int
+    vice_captain_id: int
+    chip: Optional[str] = None
+
+
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+
+def get_user_id(x_user: Optional[str], explicit: Optional[int]) -> int:
+    """Allow user id via header X-User or JSON body."""
+    if explicit:
+        return int(explicit)
+    if x_user:
+        return int(x_user)
+    raise HTTPException(status_code=400, detail="Missing user id (X-User header or body userId).")
+
+
+def ensure_gameweek(db: Session, gw_id: int) -> Gameweek:
+    gw = db.query(Gameweek).filter(Gameweek.id == gw_id).one_or_none()
+    if not gw:
+        gw = Gameweek(
+            id=gw_id,
+            name=f"GW{gw_id}",
+            deadline_at=datetime.utcnow() + timedelta(days=7)
+        )
+        db.add(gw)
+        db.commit()
+    return gw
+
+
+# ------------------------------------------------------------------------------
+# Core endpoints
+# ------------------------------------------------------------------------------
+
+@app.post("/register")
+def register(inp: RegisterIn, db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.email == inp.email).one_or_none()
+    if existing:
+        return {"id": existing.id}
+    u = User(name=inp.name, email=inp.email)
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return {"id": u.id}
+
 
 @app.get("/me")
-def me(user: User = Depends(current_user)):
-    return {"id": user.id, "email": user.email, "name": user.name}
+def me(x_user: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
+    if not x_user:
+        raise HTTPException(status_code=400, detail="X-User header required")
+    u = db.query(User).filter(User.id == int(x_user)).one_or_none()
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"id": u.id, "name": u.name, "email": u.email}
+
 
 @app.post("/league/create")
-def create_league(req: LeagueCreateReq, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    lg = League(name=req.name, creator_id=user.id); db.add(lg); db.commit(); db.refresh(lg)
-    le = LeagueEntry(league_id=lg.id, user_id=user.id, team_name=req.team_name); db.add(le); db.commit(); db.refresh(le)
-    return {"league_id": lg.id, "entry_id": le.id}
+def league_create(
+    inp: LeagueCreateIn,
+    x_user: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    user_id = get_user_id(x_user, inp.userId)
+    user = db.query(User).filter(User.id == user_id).one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    league = League(name=inp.name or "League", owner_id=user_id)
+    db.add(league)
+    db.commit()
+    db.refresh(league)
+
+    team_name = inp.team_name or inp.teamName or f"{user.name}'s Team"
+    entry = Entry(league_id=league.id, user_id=user_id, team_name=team_name)
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    return {"league_id": league.id, "entry_id": entry.id}
+
 
 @app.post("/league/join")
-def join_league(req: JoinLeagueReq, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    lg = db.query(League).get(req.league_id)
-    if not lg: raise HTTPException(404, "League not found")
-    if db.query(LeagueEntry).filter_by(league_id=lg.id, user_id=user.id).first():
-        raise HTTPException(400, "Already joined")
-    le = LeagueEntry(league_id=lg.id, user_id=user.id, team_name=req.team_name); db.add(le); db.commit(); db.refresh(le)
-    return {"entry_id": le.id}
+def league_join(
+    inp: LeagueJoinIn,
+    x_user: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    user_id = get_user_id(x_user, inp.userId)
+    league_id = inp.leagueId or inp.league_id
+    if not league_id:
+        raise HTTPException(status_code=400, detail="league_id required")
 
-@app.post("/players/seed")
-def seed_players(req: SeedReq, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    for it in req.players:
-        p = db.query(Player).filter_by(name=it.name, team=it.team, position=it.position).first()
-        if not p:
-            p = Player(name=it.name, team=it.team, position=it.position)
-            db.add(p); db.commit(); db.refresh(p)
-        if not db.query(PlayerPrice).filter_by(player_id=p.id, effective_from_gw=1).first():
-            db.add(PlayerPrice(player_id=p.id, price=it.price, effective_from_gw=1)); db.commit()
-    return {"status":"ok"}
+    league = db.query(League).filter(League.id == league_id).one_or_none()
+    if not league:
+        raise HTTPException(status_code=404, detail="League not found")
+
+    # upsert entry
+    entry = (
+        db.query(Entry)
+        .filter(Entry.league_id == league_id, Entry.user_id == user_id)
+        .one_or_none()
+    )
+    if not entry:
+        team_name = inp.team_name or inp.teamName or "My Team"
+        entry = Entry(league_id=league_id, user_id=user_id, team_name=team_name)
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+
+    return {"league_id": league_id, "entry_id": entry.id}
+
 
 @app.get("/players")
 def list_players(db: Session = Depends(get_db)):
-    items = db.query(Player).all()
-    out=[]
-    for p in items:
-        pr = db.query(PlayerPrice).filter_by(player_id=p.id).order_by(PlayerPrice.effective_from_gw.desc()).first()
-        out.append({"id":p.id,"name":p.name,"team":p.team,"position":p.position.value,"price":pr.price if pr else None})
+    """Return players with BOTH key styles for FE compatibility."""
+    rows = db.query(Player).order_by(Player.pos, Player.price_m.desc()).all()
+    out = []
+    for p in rows:
+        out.append({
+            "id": p.id,
+            "name": p.name,
+            "team": p.team,
+            "pos": p.pos,
+            "position": p.pos,        # alias
+            "price_m": float(p.price_m),
+            "price": float(p.price_m) # alias
+        })
     return out
 
-@app.post("/gameweeks/create")
-def create_gw(req: GwCreateReq, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    if db.query(Gameweek).get(req.id): raise HTTPException(400,"GW exists")
-    db.add(Gameweek(id=req.id, name=req.name, deadline_at=req.deadline_at)); db.commit()
-    return {"status":"ok"}
+
+# --------------------------- NEW: /players/sync (Sleeper) ---------------------
+
+VALID_POS = {"QB", "RB", "WR", "TE", "K", "DEF"}  # Sleeper uses DEF (we map to DST)
+
+
+def price_for_player(p: Dict[str, Any]) -> float:
+    """
+    Simple, transparent pricing heuristic:
+    - base by position
+    - +2.0m if depth_chart_order == 1 (projected starter)
+    - +0.7m if years_exp >= 5
+    bounded to [4.0, 13.0]
+    """
+    base = {"QB": 8.0, "RB": 7.5, "WR": 7.5, "TE": 6.0, "K": 5.0, "DEF": 5.0}
+    pos = p.get("position")
+    price = base.get(pos, 6.0)
+    if p.get("depth_chart_order") == 1:
+        price += 2.0
+    if (p.get("years_exp") or 0) >= 5:
+        price += 0.7
+    return round(max(4.0, min(price, 13.0)), 1)
+
+
+@app.post("/players/sync", tags=["players"], summary="Sync all active NFL players from Sleeper")
+async def sync_players(db: Session = Depends(get_db)):
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get("https://api.sleeper.app/v1/players/nfl")
+            r.raise_for_status()
+            payload = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Sleeper fetch failed: {e}")
+
+    created = 0
+    updated = 0
+
+    for sid, p in payload.items():
+        if not p or not p.get("active"):
+            continue
+        pos = p.get("position")
+        if pos not in VALID_POS:
+            continue
+
+        ext_id = str(sid)
+        name = (p.get("full_name") or f"{(p.get('first_name') or '').strip()} {(p.get('last_name') or '').strip()}").strip()
+        team = (p.get("team") or "").upper()
+        pos_app = "DST" if pos == "DEF" else pos
+        price_m = price_for_player(p)
+
+        obj = db.query(Player).filter(Player.external_id == ext_id).one_or_none()
+        if obj:
+            obj.name = name
+            obj.team = team
+            obj.pos = pos_app
+            obj.price_m = price_m
+            updated += 1
+        else:
+            db.add(Player(
+                external_id=ext_id,
+                name=name,
+                team=team,
+                pos=pos_app,
+                price_m=price_m,
+            ))
+            created += 1
+
+    db.commit()
+    return {"ok": True, "created": created, "updated": updated}
+
+
+# ------------------------------ Squad / Lineup --------------------------------
+
+@app.get("/squad")
+def get_squad(
+    user_id: int = Query(...),
+    league_id: Optional[int] = Query(None),  # not used in MVP, present for FE
+    gw: int = Query(..., ge=1),
+    db: Session = Depends(get_db)
+):
+    picks = (
+        db.query(SquadPick)
+        .filter(SquadPick.user_id == user_id, SquadPick.gameweek == gw)
+        .all()
+    )
+    return {"picks": [{"player_id": sp.player_id} for sp in picks]}
+
 
 @app.post("/squad/set")
-def set_squad(req: SquadSetReq, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    le = db.query(LeagueEntry).filter_by(user_id=user.id).order_by(LeagueEntry.id.desc()).first()
-    if not le: raise HTTPException(400,"Join a league first")
-    # (MVP) skip deep validation
-    csv = ",".join(map(str, req.player_ids))
-    sq = db.query(Squad).filter_by(entry_id=le.id, gameweek_id=req.gameweek).first()
-    if not sq:
-        sq = Squad(entry_id=le.id, gameweek_id=req.gameweek, player_ids_csv=csv)
-        db.add(sq)
-    else:
-        sq.player_ids_csv = csv
+def set_squad(
+    inp: SquadSetIn,
+    x_user: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    user_id = get_user_id(x_user, None)
+    ensure_gameweek(db, inp.gameweek)
+    player_ids = inp.player_ids or inp.picks or []
+
+    # enforce 15-man squad
+    if len(player_ids) != 15:
+        raise HTTPException(status_code=400, detail="You must submit exactly 15 player_ids.")
+
+    # validate players exist
+    count = db.query(Player).filter(Player.id.in_(player_ids)).count()
+    if count != 15:
+        raise HTTPException(status_code=400, detail="One or more player_ids not found.")
+
+    # replace existing squad
+    db.query(SquadPick).filter(
+        SquadPick.user_id == user_id, SquadPick.gameweek == inp.gameweek
+    ).delete(synchronize_session=False)
+
+    for pid in player_ids:
+        db.add(SquadPick(user_id=user_id, gameweek=inp.gameweek, player_id=pid))
     db.commit()
-    return {"status":"ok"}
+    return {"ok": True, "saved": 15}
+
 
 @app.post("/lineup/set")
-def set_lineup(req: LineupSetReq, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    le = db.query(LeagueEntry).filter_by(user_id=user.id).order_by(LeagueEntry.id.desc()).first()
-    if not le: raise HTTPException(400,"Join a league first")
-    sq = db.query(Squad).filter_by(entry_id=le.id, gameweek_id=req.gameweek).first()
-    if not sq: raise HTTPException(400,"Set a squad first")
-    sq.starters_csv = ",".join(map(str, req.starters))
-    sq.captain_id = req.captain_id
-    sq.vice_captain_id = req.vice_captain_id
-    sq.chips = req.chip or ""
+def set_lineup(
+    inp: LineupSetIn,
+    x_user: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    user_id = get_user_id(x_user, None)
+    ensure_gameweek(db, inp.gameweek)
+
+    # starters must be exactly 9
+    if len(inp.starters) != 9:
+        raise HTTPException(status_code=400, detail="Starters must be exactly 9 players.")
+
+    # captain/vice must be among starters and different
+    if inp.captain_id == inp.vice_captain_id:
+        raise HTTPException(status_code=400, detail="Captain and vice must be different.")
+    if inp.captain_id not in inp.starters or inp.vice_captain_id not in inp.starters:
+        raise HTTPException(status_code=400, detail="Captain and vice must be among starters.")
+
+    # starters must be subset of saved squad
+    squad_ids = [
+        sp.player_id
+        for sp in db.query(SquadPick).filter(
+            SquadPick.user_id == user_id, SquadPick.gameweek == inp.gameweek
+        ).all()
+    ]
+    if len(squad_ids) != 15:
+        raise HTTPException(status_code=400, detail="Set your 15-man squad first.")
+
+    if not set(inp.starters).issubset(set(squad_ids)):
+        raise HTTPException(status_code=400, detail="Starters must be chosen from your squad.")
+
+    # upsert lineup
+    obj = (
+        db.query(Lineup)
+        .filter(Lineup.user_id == user_id, Lineup.gameweek == inp.gameweek)
+        .one_or_none()
+    )
+    starters_json = json.dumps(inp.starters)
+    if obj:
+        obj.starters_json = starters_json
+        obj.captain_id = inp.captain_id
+        obj.vice_captain_id = inp.vice_captain_id
+        obj.chip = inp.chip
+    else:
+        obj = Lineup(
+            user_id=user_id,
+            gameweek=inp.gameweek,
+            starters_json=starters_json,
+            captain_id=inp.captain_id,
+            vice_captain_id=inp.vice_captain_id,
+            chip=inp.chip,
+        )
+        db.add(obj)
     db.commit()
-    return {"status":"ok"}
+    return {"ok": True}
+
 
 @app.get("/standings/{league_id}")
-def standings(league_id:int, db: Session = Depends(get_db)):
-    rows = db.query(LeagueEntry).filter_by(league_id=league_id).all()
-    return [{"entry_id":r.id, "team_name":r.team_name, "points":r.total_points} for r in rows]
+def standings(league_id: int, db: Session = Depends(get_db)):
+    """Very simple standings: returns team name and points (default 0 in MVP)."""
+    rows = (
+        db.query(Entry)
+        .filter(Entry.league_id == league_id)
+        .order_by(Entry.points.desc(), Entry.team_name.asc())
+        .all()
+    )
+    return [{"entry_id": e.id, "team_name": e.team_name, "points": e.points} for e in rows]
 
-# --- Demo seed (quick start) ---
-@app.post("/demo/seed_all")
-def demo_seed(db: Session = Depends(get_db)):
-    # seed a few players with prices
-    demo = [
-        ("Patrick Mahomes","KC",Position.QB, 12.5),
-        ("Christian McCaffrey","SF",Position.RB, 10.5),
-        ("Justin Jefferson","MIN",Position.WR, 11.5),
-        ("Travis Kelce","KC",Position.TE, 10.0),
-        ("Justin Tucker","BAL",Position.K, 5.5),
-        ("49ers DST","SF",Position.DST, 5.0),
-    ]
-    for n,t,pos,price in demo:
-        p = db.query(Player).filter_by(name=n, team=t, position=pos).first()
-        if not p:
-            p = Player(name=n, team=t, position=pos); db.add(p); db.commit(); db.refresh(p)
-        if not db.query(PlayerPrice).filter_by(player_id=p.id, effective_from_gw=1).first():
-            db.add(PlayerPrice(player_id=p.id, price=price, effective_from_gw=1)); db.commit()
-    # seed a GW
-    if not db.query(Gameweek).get(1):
-        db.add(Gameweek(id=1, name="GW1", deadline_at=datetime.utcnow()+timedelta(days=1))); db.commit()
-    return {"status":"ok"}
+
+# ------------------------------ Utilities / Admin -----------------------------
+
+class GWCreateIn(BaseModel):
+    id: int
+    name: Optional[str] = None
+    deadline_at: Optional[datetime] = None
+
+
+@app.post("/gameweeks/create")
+def create_gw(inp: GWCreateIn, db: Session = Depends(get_db)):
+    gw = db.query(Gameweek).filter(Gameweek.id == inp.id).one_or_none()
+    if gw:
+        raise HTTPException(status_code=400, detail="Gameweek already exists")
+    gw = Gameweek(
+        id=inp.id,
+        name=inp.name or f"GW{inp.id}",
+        deadline_at=inp.deadline_at or (datetime.utcnow() + timedelta(days=7)),
+    )
+    db.add(gw)
+    db.commit()
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------------------
+# Root
+# ------------------------------------------------------------------------------
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "GridCap API"}
+
+
+# ------------------------------------------------------------------------------
+# Run (local dev)
+# ------------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
